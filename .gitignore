@@ -1,0 +1,13 @@
+.DS_Store
+
+*.zip
+
+*.json
+ckpt/
+__pycache__/
+cache/
+cache_old/
+.vscode/
+tensorboard/
+tensorboard_*/
+logs/
