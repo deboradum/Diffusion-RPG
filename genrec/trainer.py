@@ -20,10 +20,6 @@ from genrec.tokenizer import AbstractTokenizer
 from genrec.evaluator import Evaluator
 from genrec.utils import get_file_name, get_total_steps, config_for_log, log
 
-
-# For debugging
-torch.autograd.set_detect_anomaly(True)
-
 class Trainer:
     """
     A class that handles the training process for a model.
@@ -96,8 +92,7 @@ class Trainer:
             init_kwargs={"tensorboard": {"flush_secs": 60}},
         )
 
-        # n_epochs = np.ceil(total_n_steps / (len(train_dataloader) * self.accelerator.num_processes)).astype(int)
-        n_epochs = 70  # TODO: Uncomment
+        n_epochs = np.ceil(total_n_steps / (len(train_dataloader) * self.accelerator.num_processes)).astype(int)
         best_epoch = 0
         best_val_score = -1
 
