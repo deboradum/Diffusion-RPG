@@ -47,30 +47,31 @@ class Denoiser(nn.Module):
         with torch.no_grad():
             self.mask_embeddings.weight.normal_(0, 0.02)
 
-    def forward(self, target_tokens, memory_context, memory_padding_mask):
+    def forward(self, target_tokens, user_history, memory_padding_mask):
         """
         Args:
             target_tokens (batch_size, n_digit): (Partially) masked target token IDs
-            memory_context (batch_size, seq_len, n_embd): Full sequence context history
+            user_history (batch_size, seq_len, n_embd): Full sequence context history
             memory_padding_mask (batch_size, seq_len): Boolean mask where True blocks attention
         """
         B = target_tokens.size(0)
 
         is_masked = (target_tokens == self.mask_token_id) # (B, n_digit)
 
-        # Temporarily replace the mask_token_id with 0 to avoid index out-of-bounds in target_embeddings.
+        # Get token embeddings for unmasked tokens
         safe_tokens = target_tokens.masked_fill(is_masked, 0)
         token_embs = self.target_embeddings(safe_tokens) # (B, n_digit, n_embd)
 
+        # Get mask embeddings for masked tokens
         pos_ids = torch.arange(self.n_digit, device=target_tokens.device)
         mask_embs = self.mask_embeddings(pos_ids).unsqueeze(0).expand(B, -1, -1) # (B, n_digit, n_embd)
 
-        # Mask where needed
+        # Set token/ mask embeddings
         tgt = torch.where(is_masked.unsqueeze(-1), mask_embs, token_embs)
 
         output_states = self.transformer(
             tgt=tgt,
-            memory=memory_context,
+            memory=user_history,
             memory_key_padding_mask=memory_padding_mask
         )
         output_states = self.final_proj(output_states)
@@ -194,7 +195,7 @@ class DRPG(AbstractModel):
             selected_target_labels = target_labels[batch_idx, time_idx]  # (B_eff, n_digit)
             target_tokens = selected_target_labels.clone()  # (B_eff, n_digit)
 
-            # On-Policy Confidence Estimation (OCN). See section 3.3 in https://arxiv.org/pdf/2510.21805
+            # On-Policy Confidence Estimation (OCN). See section 3.3 in https://arxiv.org/pdf/2510.21805. Focus on most uncertain digits.
             # "we compute the difficulty order once per example with a single fully masked pass, reuse the encoder output across the 𝑅 views"
             with torch.no_grad():
                 # "run the MD-Decoder once on a fully masked 𝑛-digit input"
@@ -317,6 +318,82 @@ class DRPG(AbstractModel):
 
         return item_item_sim
 
+    def build_ii_sim_mat(self):
+        # Assuming n_digit=32, codebook_size=256
+        n_items = self.dataset.n_items
+        n_digit = self.tokenizer.n_digit
+        codebook_size = self.tokenizer.codebook_size
+
+        # 1) Reshape first 8192 rows of token embeddings into [32, 256, d]
+        #    ignoring 2 rows which might be special tokens
+        #    shape: (32, 256, d)
+        token_embs = self.gpt2.wte.weight[1:-1].view(n_digit, codebook_size, -1)
+
+        # 2) Normalize each (256, d) sub-matrix to compute pairwise cosine similarities
+        #    We'll do this in a batch for all 32 groups.
+        # We do a batch matrix multiply to get (256 x 256) for each group
+        # => token_sims: (32, 256, 256)
+        token_embs = F.normalize(token_embs, dim=-1)
+        token_sims = torch.bmm(token_embs, token_embs.transpose(1, 2))
+
+        # 3) Convert [-1, 1] to [0, 1] range
+        token_sims_01 = 0.5 * (token_sims + 1.0)  # shape: (32, 256, 256)
+
+        # 4) Prepare an output similarity matrix
+        item_item_sim = torch.zeros((n_items, n_items), device=self.gpt2.device, dtype=torch.float32)
+
+        # 5) Fill the item-item matrix in chunks
+        for i_start in range(1, n_items, self.chunk_size):
+            i_end = min(i_start + self.chunk_size, n_items)
+
+            # shape: (chunk_i_size, 32)
+            tokens_i = self.item_id2tokens[i_start:i_end]  # sub-block for items i
+
+            for j_start in range(1, n_items, self.chunk_size):
+                j_end = min(j_start + self.chunk_size, n_items)
+
+                # shape: (chunk_j_size, 32)
+                tokens_j = self.item_id2tokens[j_start:j_end]  # sub-block for items j
+
+                # We want to compute a sub-block of shape: (chunk_i_size, chunk_j_size).
+                # For each digit k in [0..31], we look up token_sims_01[k, tokens_i[i, k], tokens_j[j, k]].
+
+                # We'll accumulate the similarity for each of the 32 digits
+                block_size_i = i_end - i_start
+                block_size_j = j_end - j_start
+                sum_block = torch.zeros((block_size_i, block_size_j), device=self.gpt2.device, dtype=torch.float32)
+
+                # We'll do a small loop over k=0..31 (which is constant = 32).
+                # Each token_sims_01[k] is (256, 256). We gather from it using:
+                #   row indices = tokens_i[:, k]
+                #   col indices = tokens_j[:, k]
+                #
+                # The typical approach is:
+                #   sub = token_sims_01[k].index_select(0, row_inds).index_select(1, col_inds)
+                # Then sum them up across k.
+                for k in range(n_digit):
+                    # row_inds shape: (block_size_i,)
+                    row_inds = tokens_i[:, k] - k * codebook_size - 1
+                    # col_inds shape: (block_size_j,)
+                    col_inds = tokens_j[:, k] - k * codebook_size - 1
+
+                    # token_sims_01[k] -> shape (256, 256)
+                    # row-gather => shape (block_size_i, 256)
+                    temp = token_sims_01[k].index_select(0, row_inds)
+                    # col-gather across dim=1 => shape (block_size_i, block_size_j)
+                    temp = temp.index_select(1, col_inds)
+
+                    # Accumulate
+                    sum_block += temp
+
+                # Now take the average across the 32 digits
+                avg_block = sum_block / n_digit
+
+                # Write back into the final item_item_sim
+                item_item_sim[i_start:i_end, j_start:j_end] = avg_block
+
+        return item_item_sim
+
     def build_adjacency_list(self, item_item_sim):
         return torch.topk(item_item_sim, k=self.n_edges, dim=-1).indices
 
@@ -329,10 +406,12 @@ class DRPG(AbstractModel):
     def graph_propagation(self, token_logits, n_return_sequences):
         batch_size = token_logits.shape[0]
 
+        # Initialize visited nodes tracking
         visited_nodes = {}
         for batch_id in range(batch_size):
             visited_nodes[batch_id] = set()
 
+        # Randomly sample num_beams distinct node IDs in [1..n_nodes]
         topk_nodes_sorted = torch.randint(
             1, self.dataset.n_items,
             (batch_size, self.num_beams),
@@ -340,17 +419,21 @@ class DRPG(AbstractModel):
             device=token_logits.device
         )
 
+        # Add initial nodes to visited set
         for batch_id in range(batch_size):
             for node in topk_nodes_sorted[batch_id].cpu().numpy().tolist():
                 visited_nodes[batch_id].add(node)
 
         for sid in range(self.propagation_steps):
+            # Find neighbors of these top num_beams nodes
+            #      adjacency_list is 0-based internally => need node_id-1
             all_neighbors = self.adjacency[topk_nodes_sorted].view(batch_size, -1)
 
             next_nodes = []
             for batch_id in range(batch_size):
                 neighbors_in_batch = torch.unique(all_neighbors[batch_id])
 
+                # Add neighbors to visited set
                 for node in neighbors_in_batch.cpu().numpy().tolist():
                     visited_nodes[batch_id].add(node)
 
@@ -364,6 +447,7 @@ class DRPG(AbstractModel):
                 next_nodes.append(neighbors_in_batch[idxs])
             topk_nodes_sorted = torch.stack(next_nodes, dim=0)
 
+        # Convert visited counts to tensor
         visited_counts = torch.FloatTensor([[len(visited_nodes[batch_id])] for batch_id in range(batch_size)])
 
         return topk_nodes_sorted[:,:n_return_sequences].unsqueeze(-1), visited_counts
