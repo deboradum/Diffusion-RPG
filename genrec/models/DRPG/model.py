@@ -272,53 +272,6 @@ class DRPG(AbstractModel):
         return outputs
 
     def build_ii_sim_mat(self):
-        n_items = self.dataset.n_items
-        n_digit = self.tokenizer.n_digit
-        codebook_size = self.tokenizer.codebook_size
-
-        token_embs = self.gpt2.wte.weight[1:-1].view(n_digit, codebook_size, -1)
-
-        token_embs = F.normalize(token_embs, dim=-1)
-        token_sims = torch.bmm(token_embs, token_embs.transpose(1, 2))
-
-        # 3) Convert [-1, 1] to [0, 1] range
-        token_sims_01 = 0.5 * (token_sims + 1.0)  # shape: (32, 256, 256)
-
-        # 4) Prepare an output similarity matrix
-        item_item_sim = torch.zeros((n_items, n_items), device=self.gpt2.device, dtype=torch.float32)
-
-        for i_start in range(1, n_items, self.chunk_size):
-            i_end = min(i_start + self.chunk_size, n_items)
-            tokens_i = self.item_id2tokens[i_start:i_end]
-
-            for j_start in range(1, n_items, self.chunk_size):
-                j_end = min(j_start + self.chunk_size, n_items)
-
-                # shape: (chunk_j_size, 32)
-                tokens_j = self.item_id2tokens[j_start:j_end]  # sub-block for items j
-
-                # We want to compute a sub-block of shape: (chunk_i_size, chunk_j_size).
-                # For each digit k in [0..31], we look up token_sims_01[k, tokens_i[i, k], tokens_j[j, k]].
-
-                # We'll accumulate the similarity for each of the 32 digits
-                block_size_i = i_end - i_start
-                block_size_j = j_end - j_start
-                sum_block = torch.zeros((block_size_i, block_size_j), device=self.gpt2.device, dtype=torch.float32)
-
-                for k in range(n_digit):
-                    row_inds = tokens_i[:, k] - k * codebook_size - 1
-                    col_inds = tokens_j[:, k] - k * codebook_size - 1
-
-                    temp = token_sims_01[k].index_select(0, row_inds)
-                    temp = temp.index_select(1, col_inds)
-                    sum_block += temp
-
-                avg_block = sum_block / n_digit
-                item_item_sim[i_start:i_end, j_start:j_end] = avg_block
-
-        return item_item_sim
-
-    def build_ii_sim_mat(self):
         # Assuming n_digit=32, codebook_size=256
         n_items = self.dataset.n_items
         n_digit = self.tokenizer.n_digit
