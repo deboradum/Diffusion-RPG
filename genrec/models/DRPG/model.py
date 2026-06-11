@@ -108,7 +108,6 @@ class DRPG(AbstractModel):
 
         self.n_digit = self.tokenizer.n_digit
         self.mask_token_id = tokenizer.vocab_size
-        self.num_timesteps = config['num_timesteps']
 
         # Digit positional embeddings instead of diffGRM's itemMLP, since the itemMLP contains way to many parameters due to our large n_digits compared to diffGRM's 4 digits.
         self.digit_pos_emb = nn.Embedding(self.n_digit, config['n_embd'])
@@ -267,7 +266,6 @@ class DRPG(AbstractModel):
             # Demask with Cross-Attention Head
             final_states = self.denoiser(target_tokens_multi, memory_context_multi, memory_mask_multi)
 
-            # Keep normalization
             final_states = F.normalize(final_states, dim=-1, eps=1e-8)
             final_states = torch.chunk(final_states, self.n_digit, dim=1)
 
