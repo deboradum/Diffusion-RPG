@@ -173,7 +173,13 @@ class DecoderBlock(nn.Module):
                 encoder_kv = cross_key_value
             else:
                 # Legacy compatibility logic: Recompute (only used for non-optimized paths)
-                encoder_kv = torch.cat([encoder_hidden, encoder_hidden], dim=-1)  # Concat K and V
+                # encoder_kv = torch.cat([encoder_hidden, encoder_hidden], dim=-1)  # Concat K and V
+
+                # Edited: Apply the qkv weights
+                kv_proj = self.cross_attn.qkv(encoder_hidden)
+                k = kv_proj[..., self.ln_1.weight.shape[0]:2*self.ln_1.weight.shape[0]]
+                v = kv_proj[..., 2*self.ln_1.weight.shape[0]:]
+                encoder_kv = torch.cat([k, v], dim=-1)
 
             cross_attn_output, cross_present = self.cross_attn(
                 self.ln_2(x),
@@ -1264,8 +1270,7 @@ class DIFF_GRMGRAPH(AbstractModel):
                         current_targets = next_targets
                         current_mask = next_mask
 
-                    token_logits = F.log_softmax(final_logits, dim=-1)
-                    # token_logits = final_logits  # [B, n_digit, codebook_size]
+                    token_logits = F.log_softmax(final_logits, dim=-1)  # [B, n_digit, codebook_size]
 
                     if not getattr(self, 'init_flag', False):
                         self.init_graph()
