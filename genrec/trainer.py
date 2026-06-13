@@ -183,11 +183,10 @@ class Trainer:
                     all_results[key].append(value)
 
         output_results = OrderedDict()
-        for metric in self.config['metrics']:
-            for k in self.config['topk']:
-                key = f"{metric}@{k}"
-                output_results[key] = torch.cat(all_results[key]).mean().item()
-        output_results['n_visited_items'] = torch.cat(all_results['n_visited_items']).mean().item()
+        for key in all_results.keys():
+            # torch.cat handles both scalars and arrays returned across the batch
+            output_results[key] = torch.cat(all_results[key]).mean().item()
+        # output_results['n_visited_items'] = torch.cat(all_results['n_visited_items']).mean().item()
         return output_results
 
     def case_evaluate(self, dataloader, split='test'):
