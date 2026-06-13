@@ -1218,29 +1218,29 @@ class DIFF_GRMGRAPH(AbstractModel):
                     denoise_steps = self.config['denoise_inference_steps']
                     steps = min(denoise_steps, n_digit)
 
-                    current_input_ids = torch.zeros(batch_size, n_digit, device=device, dtype=torch.long)
-                    current_mask_positions = torch.ones(batch_size, n_digit, device=device) # 1.0 = masked
+                    current_targets = torch.zeros(batch_size, n_digit, dtype=torch.long, device=device)
+                    current_mask = torch.ones(batch_size, n_digit, dtype=torch.bool, device=device)
 
-                    final_logits_stack = None
+                    final_logits = None
 
                     for step in range(1, steps + 1):
-                        is_masked = current_mask_positions.bool()
+                        is_masked = current_mask
 
                         # Build batch for the current step
                         batch_dict = {
-                            'decoder_input_ids': current_input_ids,
+                            'decoder_input_ids': current_targets,
                             'encoder_hidden': encoder_hidden,
-                            'mask_positions': current_mask_positions.float()
+                            'mask_positions': current_mask.float()
                         }
 
                         # use_cache=False since self-attention pattern changed
                         outputs = self.forward_decoder_only(batch_dict, digit=None, use_cache=False)
-                        logits_stack = outputs.logits  # [B, n_digit, codebook_size]
+                        logits = outputs.logits  # [B, n_digit, codebook_size]
 
                         if step == steps:
-                            final_logits_stack = logits_stack
+                            final_logits = logits
 
-                        probs = torch.softmax(logits_stack, dim=-1)
+                        probs = torch.softmax(logits, dim=-1)
                         max_probs, pred_ids = probs.max(dim=-1)
 
                         confidence = max_probs.clone()
@@ -1253,18 +1253,19 @@ class DIFF_GRMGRAPH(AbstractModel):
                             # Else only unmask one (n_digit=4 & step=1 = 3 masked.)
                             num_to_mask = self.n_digit - step
 
-                        next_input_ids = torch.where(is_masked, pred_ids, current_input_ids)
-                        next_mask_positions = torch.zeros_like(current_mask_positions)
+                        next_targets = torch.where(is_masked, pred_ids, current_targets)
+                        next_mask = torch.zeros_like(current_mask)
 
                         if num_to_mask > 0:
                             # Keep the `num_to_mask` slots with the lowest confidence masked
                             mask_idx = torch.topk(confidence, k=num_to_mask, dim=-1, largest=False).indices
-                            next_mask_positions.scatter_(1, mask_idx, 1.0)
+                            next_mask.scatter_(1, mask_idx, True)
 
-                        current_input_ids = next_input_ids
-                        current_mask_positions = next_mask_positions
+                        current_targets = next_targets
+                        current_mask = next_mask
 
-                    token_logits = final_logits_stack  # [B, n_digit, codebook_size]
+                    token_logits = F.log_softmax(final_logits, dim=-1)
+                    # token_logits = final_logits  # [B, n_digit, codebook_size]
 
                     if not getattr(self, 'init_flag', False):
                         self.init_graph()
