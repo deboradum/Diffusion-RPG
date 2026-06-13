@@ -27,7 +27,6 @@ class Denoiser(nn.Module):
         self.target_embeddings = nn.Embedding(vocab_size, n_embd)
         # Separate mask embedding per position so no positional embeddings, like in diffGRM
         self.mask_embeddings = nn.Embedding(n_digit, n_embd)
-        self.pos_embedding = nn.Embedding(n_digit, n_embd)
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=n_embd,
@@ -38,7 +37,14 @@ class Denoiser(nn.Module):
             activation='gelu',
             norm_first=True,
         )
-        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
+
+        final_norm = nn.LayerNorm(n_embd)
+        self.transformer = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=n_layers,
+            norm=final_norm,
+        )
+
 
     def init_target_embeddings(self, gpt2_wte_weights):
         # Share embedding table weights with encoder
@@ -69,7 +75,6 @@ class Denoiser(nn.Module):
 
         # Set token/ mask embeddings
         tgt = torch.where(is_masked.unsqueeze(-1), mask_embs, token_embs)
-        tgt = tgt + self.pos_embedding(pos_ids).unsqueeze(0)
 
         output_states = self.transformer(
             tgt=tgt,
@@ -189,16 +194,18 @@ class DRPG(AbstractModel):
                 temp_tokens = target_tokens.clone()
                 temp_tokens[mask_state] = self.denoiser.mask_token_id
 
-                states = self.denoiser(temp_tokens, memory_context, memory_padding_mask)
-                states = F.normalize(states, dim=-1, eps=1e-8)
-                states_chunked = torch.chunk(states, self.n_digit, dim=1)
+                denoiser_outputs = self.forward_denoiser_only({
+                    'target_tokens': temp_tokens,
+                    'memory_context': memory_context,
+                    'memory_padding_mask': memory_padding_mask
+                })
 
-                conf = torch.zeros((B, self.n_digit), device=target_tokens.device)
-                for k in range(self.n_digit):
-                    logits_i = torch.matmul(states_chunked[k].squeeze(1), ocn_token_embs[k].T) / self.temperature
-                    logits_i = torch.clamp(logits_i, min=-50.0, max=50.0)
-                    probs_i = F.softmax(logits_i, dim=-1)
-                    conf[:, k] = probs_i.max(dim=-1).values
+                # logits = torch.clamp(denoiser_outputs['logits'], min=-50.0, max=50.0)
+                logits = denoiser_outputs['logits']
+                probs = F.softmax(logits, dim=-1)
+
+                conf = probs.max(dim=-1).values
+
                 return conf
 
             all_target_tokens = []
@@ -251,25 +258,16 @@ class DRPG(AbstractModel):
             memory_context_multi = memory_context.repeat(n_views, 1, 1)  # (B * n_views, seq_len, d)
             memory_mask_multi = memory_padding_mask.repeat(n_views, 1)  # (B * n_views, seq_len)
 
-            # Demask
-            final_states = self.denoiser(target_tokens_multi, memory_context_multi, memory_mask_multi)
+            denoiser_outputs = self.forward_denoiser_only({
+                'target_tokens': target_tokens_multi,
+                'memory_context': memory_context_multi,
+                'memory_padding_mask': memory_mask_multi
+            })
 
-            final_states = F.normalize(final_states, dim=-1, eps=1e-8)
-            final_states = torch.chunk(final_states, self.n_digit, dim=1)
-
-            token_emb = self.gpt2.wte.weight[1:codebook_range]
-            token_emb = F.normalize(token_emb, dim=-1, eps=1e-8)
-            token_embs = torch.chunk(token_emb, self.n_digit, dim=0)
-
-            token_logits = []
-            for k in range(self.n_digit):
-                logits_k = torch.matmul(final_states[k].squeeze(dim=1), token_embs[k].T) / self.temperature
-
-                token_logits.append(logits_k)
+            logits = denoiser_outputs['logits']  # (B_multi, n_digit, codebook_size)
 
             # micro-averaging loss like diffGRM instead of macro-avg loss in RPG, slightly more stable because not every digit is masked an equal number of time
-            logits_stack = torch.stack(token_logits, dim=1)  # (B_multi, n_digit, codebook_size)
-            logits_flat = logits_stack.view(-1, self.config['codebook_size'])
+            logits_flat = logits.view(-1, self.config['codebook_size'])
             labels_flat = shifted_labels_multi.view(-1)
 
             outputs.loss = self.loss_fct(logits_flat, labels_flat)
@@ -280,6 +278,48 @@ class DRPG(AbstractModel):
             outputs.memory_padding_mask = ~batch['history_mask']  # (B, seq_len)
 
         return outputs
+
+    def forward_denoiser_only(self, batch: dict) -> dict:
+        """
+        Runs only the denoiser (decoder) part of the model.
+
+        Args:
+            batch: Dictionary containing:
+                - target_tokens: (B, n_digit)
+                - memory_context: (B, seq_len, n_embd)
+                - memory_padding_mask: (B, seq_len)
+
+        Returns:
+            A dictionary containing 'hidden_states' and 'logits'.
+        """
+        device = next(self.parameters()).device
+
+        target_tokens = batch['target_tokens'].to(device)  # decoder_inputs in DiffGRM
+        memory_context = batch['memory_context'].to(device)  # encoder_hidden in DiffGRM
+        memory_padding_mask = batch['memory_padding_mask'].to(device)  # Different from DiffGRM's mask_positions. Masks are already in target_tokens and read in Denoiser.forward()
+
+        # Pass through the denoiser
+        states = self.denoiser(target_tokens, memory_context, memory_padding_mask)
+        states = F.normalize(states, dim=-1, eps=1e-8)
+
+        # Extract token embeddings for logit computation
+        codebook_range = self.n_digit * self.config['codebook_size'] + 1
+        token_emb = self.gpt2.wte.weight[1:codebook_range]
+        token_emb = F.normalize(token_emb, dim=-1, eps=1e-8)
+        token_embs = torch.chunk(token_emb, self.n_digit, dim=0)
+
+        # Compute logits per digit
+        logits = []
+        for i in range(self.n_digit):
+            logit = torch.matmul(states[:, i, :], token_embs[i].T) / self.temperature
+            logits.append(logit)
+
+        logits_stack = torch.stack(logits, dim=1)  # (B, n_digit, codebook_size)
+
+        return {
+            "hidden_states": states,
+            "logits": logits_stack
+        }
 
     def build_ii_sim_mat(self):
         # Assuming n_digit=32, codebook_size=256
@@ -437,11 +477,6 @@ class DRPG(AbstractModel):
                     device=device
                 )
 
-                codebook_range = self.n_digit * self.config['codebook_size'] + 1
-                token_emb = self.gpt2.wte.weight[1:codebook_range]
-                token_emb = F.normalize(token_emb, dim=-1, eps=1e-8)
-                token_embs = torch.chunk(token_emb, self.n_digit, dim=0)
-
                 offsets = torch.arange(self.n_digit, device=device) * self.config['codebook_size'] + 1
 
                 # Keep track of the final states for scoring
@@ -450,14 +485,16 @@ class DRPG(AbstractModel):
                 for step in range(1, denoise_steps + 1):
                     is_masked = (current_targets == self.denoiser.mask_token_id)
 
-                    states = self.denoiser(current_targets, memory_context, memory_padding_mask)
-                    states = F.normalize(states, dim=-1, eps=1e-8)
+                    denoiser_outputs = self.forward_denoiser_only({
+                        'target_tokens': current_targets,
+                        'memory_context': memory_context,
+                        'memory_padding_mask': memory_padding_mask
+                    })
+
+                    logits_stack = denoiser_outputs['logits']
 
                     if step == denoise_steps:
-                        final_states = states
-
-                    logits = [torch.matmul(states[:,i,:], token_embs[i].T) / self.temperature for i in range(self.n_digit)]
-                    logits_stack = torch.stack(logits, dim=1)  # (B, n_digit, codebook_size)
+                        final_logits_stack = logits_stack  # (B, n_digit, codebook_size)
 
                     probs = torch.softmax(logits_stack, dim=-1)
                     max_probs, pred_ids = probs.max(dim=-1)
@@ -477,10 +514,7 @@ class DRPG(AbstractModel):
                         next_targets.scatter_(1, mask_idx, self.denoiser.mask_token_id)
                     current_targets = next_targets
 
-                # refined_log_probs = F.log_softmax(final_logits_stack, dim=-1)
-                logits = [torch.matmul(final_states[:, i, :], token_embs[i].T) / self.temperature for i in range(self.n_digit)]
-                logits = [F.log_softmax(logit, dim=-1) for logit in logits]
-                token_logits = torch.cat(logits, dim=-1)
+                token_logits = F.log_softmax(final_logits_stack, dim=-1).view(B, -1)
 
                 if self.generate_w_decoding_graph:
                     if not self.init_flag:
