@@ -1,0 +1,178 @@
+# DIFF_GRM Model Configuration
+model: DIFF_GRM
+
+# SID Configuration
+n_digit: 4
+codebook_size: 256
+share_embeddings: true
+
+# Model Architecture
+encoder_n_layer: 2
+decoder_n_layer: 2
+n_head: 4
+n_embd: 256
+n_inner: 512
+dropout: 0.1
+embd_pdrop: 0.1
+attn_pdrop: 0.1
+resid_pdrop: 0.1
+
+# Normalization
+norm_type: layernorm    # 可选: layernorm | rmsnorm
+norm_eps: 1e-5          # 建议: RMSNorm=1e-6, LayerNorm=1e-5
+
+# Output Layer Configuration
+share_decoder_output_embedding: true   # 使用共享embedding dot-product，false时回退到独立Linear
+
+# ─── 新增：要在验证/测试阶段跑的 beam 模式 ─────────────────────
+beam_search_modes: ["confidence", "random", "graph"]   # 顺序决定日志展示顺序
+# beam_search_modes: ["confidence", "random"]   # 顺序决定日志展示顺序
+# 如果只想偶尔跑 random，把它删掉即可
+
+# ─── 新增：random-beam 的采样超参（示例） ────────────────────
+random_beam:
+  beam_act: 64        # 👈 你要的 "random_beam_size"
+  beam_max: 64
+  seed: 42            # 保留，用来固定随机列顺序
+
+# Generation - 向量化Beam Search配置（统一管理）
+vectorized_beam_search:
+  # === 通用配置 ===
+  top_k_final: 10                  # 最终返回的序列数量
+  neg_inf_fp32: -1000000000.0      # FP32负无穷值 (-1e9)
+  neg_inf_fp16: -65504.0           # FP16负无穷值
+  dedup_strategy: simple            # 去重策略：simple | weighted | none
+
+  # === split-specific配置 ===
+  # 验证时使用较小的beam size，保证速度
+  val:     {beam_act: 32,  beam_max: 32}
+  # 测试时使用较大的beam size，保证精度
+  test:    {beam_act: 256, beam_max: 256}
+
+  # ↓可留可删，纯兼容旧代码
+  beam_act: 32
+  beam_max: 32
+
+# 兼容性参数（保留用于旧代码）
+beam_size: 10
+max_generation_len: 4
+
+# Diffusion Configuration
+# === Mask-Augment 相关 ===
+masking_strategy: sequential      # random | sequential | guided
+
+# sequential 连贯视图
+sequential_steps: auto        # auto(=n_digit) 或 1~n_digit 的整数（建议≤n_digit-1以跳过全揭开视图）
+sequential_paths: 1           # 同一个样本并行多少条随机路径（仅sequential模式有效）
+
+# guided 置信度引导的连贯视图
+guided_steps: auto            # auto(=n_digit) 或 1~n_digit
+guided_conf_metric: msp       # msp | entropy
+guided_refresh_each_step: false  # 是否每步刷新一次置信度（true更准，false更快）
+guided_select: most           # most | least  (揭示最有把握/最不把握的位置)
+
+# random 随机掩码
+# 新方式：按区间随机采样掩码率（LLaDA式训练稳定化），与 mask_probs 互斥
+mask_prob_random: false
+mask_prob_random_min: 0.0
+mask_prob_random_max: 1.0
+
+# 指定多概率掩码（优先级高于 mask_prob），如 "1.0,0.75,0.5,0.25"；不使用请置为 null
+mask_probs: null
+
+# 旧方式：单一掩码配置（作为备选）
+mask_prob: 0.5                     # 训练时的掩码概率（仅在未设置mask_probs时使用）
+augment_factor: 4                   # 数据增强倍数（仅在未设置mask_probs时使用）
+
+max_history_len: 50                 # 历史序列最大长度
+
+# Data Split Configuration
+split: leave_one_out          # 数据划分策略：leave_one_out | last_out
+train_sliding: false          # 是否对train做滑窗扩充（true=滑窗，false=经典leave-one-out）
+min_hist_len: 2               # 滑窗最短history长度（含label前的序列长度）
+max_hist_len: 50              # 滑窗最长history长度（与max_history_len对齐）
+
+# Sentence Embedding (for SID generation)
+metadata: sentence
+sent_emb_model: sentence-transformers/sentence-t5-base
+sent_emb_dim: 768
+sent_emb_pca: 256
+normalize_after_pca: true
+sent_emb_batch_size: 512
+
+# SID Quantization
+# opq_pq(默认) | rq_kmeans | none(随机映射)
+sid_quantizer: opq_pq
+rq_kmeans_niters: 20
+rq_kmeans_seed: 2026
+sid_random_seed: 2026
+
+# OPQ Configuration
+opq_use_gpu: False
+opq_gpu_id: 0
+faiss_omp_num_threads: 32
+force_regenerate_opq: true  # 是否强制重新生成OPQ量化结果（即使已存在）
+disable_opq: false  # 是否禁用OPQ，使用纯PQ量化
+
+# Training
+temperature: 0.07
+train_batch_size: 256
+eval_batch_size: 32
+lr: 0.003
+weight_decay: 0.0
+warmup_steps: 10000
+epochs: 200
+max_grad_norm: 1.0
+label_smoothing: 0.1
+
+
+# Evaluation
+eval_interval: 1  # 每xx轮评估一次，而不是每轮都评估
+eval_start_epoch: 20  # 从第xx个epoch开始评估
+patience: 15       # xx次评估无提升就早停
+min_delta: 0.0     # 提升至少超过这个值才算improve
+topk: [5,10]
+metrics: [ndcg,recall]
+val_metric: weighted_score  # 使用加权综合指标：weighted_score = 0.8 * ndcg_10 + 0.2 * recall_10
+
+# ── Auto mask schedule (off by default) ───────────────────────────
+mask_schedule:
+  enabled: false
+
+  # 显式两阶段管线：Stage-1 随机 sequential；Stage-2 guided(least)
+  pipeline:
+    - strategy: sequential
+      sequential_steps: auto      # = n_digit；若你想更少，写具体数，如 3
+      sequential_paths: 2         # 👈 可控，1~N（越大显存越高）
+      epochs: 10                  # 跑 10 个 epoch 后自动切换
+
+    - strategy: guided
+      guided_select: least        # 👈 只要 least，不要 most
+      guided_steps: auto          # = n_digit（或填具体数）
+      guided_conf_metric: msp     # 或 entropy
+      guided_refresh_each_step: false
+      epochs: -1                  # -1 = 直到训练结束/早停
+
+  # 建议把评估频率拉高，便于快速判断"无提升"
+  eval_start_epoch_override: 5  # 开启日程时，评估从第1个epoch就开始
+  eval_interval_override: 1     # 每个epoch评估一次
+
+# ─── 新增：消融式（减少步数）解码开关与超参（默认关闭，不影响原流程） ─────────────
+ablate_decode:
+  enabled: false           # true=启用消融；false=完全不走该分支
+  per_digit_topk: null     # 组合阶段每列先取的 topL；null=等同 beam_act
+  beam:
+    val:  { beam_act: 32 }
+    test: { beam_act: 128 }
+
+# ─── 新增：评估时将 SID 组合按簇展开到 item 再评估（可开关） ─────────────
+eval_expand_sid_to_items: false   # true=额外输出一套 _xitem 指标；false=仅原SID级指标
+eval_expand_dedup: first          # 展开前对 SID 去重策略：first（仅保留首次）
+
+
+num_beams: 50
+n_edges: 50
+propagation_steps: 3
+chunk_size: 1024
+
+denoise_inference_steps: 4
