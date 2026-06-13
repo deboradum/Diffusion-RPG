@@ -479,10 +479,10 @@ class DRPG(AbstractModel):
 
                 offsets = torch.arange(self.n_digit, device=device) * self.config['codebook_size'] + 1
 
-                # Keep track of the final states for scoring
-                final_states = None
+                final_logits_stack = None
+                steps = min(denoise_steps, self.n_digit)
 
-                for step in range(1, denoise_steps + 1):
+                for step in range(1, steps+1):
                     is_masked = (current_targets == self.denoiser.mask_token_id)
 
                     denoiser_outputs = self.forward_denoiser_only({
@@ -493,25 +493,30 @@ class DRPG(AbstractModel):
 
                     logits_stack = denoiser_outputs['logits']
 
-                    if step == denoise_steps:
+                    if step == steps:
                         final_logits_stack = logits_stack  # (B, n_digit, codebook_size)
 
                     probs = torch.softmax(logits_stack, dim=-1)
                     max_probs, pred_ids = probs.max(dim=-1)
 
                     global_pred_ids = pred_ids + offsets.unsqueeze(0)
+
                     confidence = max_probs.clone()
                     confidence[~is_masked] = 1e9
 
-                    # Progressive Cosine Unmask Schedule
-                    progress = step / denoise_steps
-                    ratio_to_mask = math.cos(progress * math.pi / 2.0)
-                    num_to_mask = max(0, int(self.n_digit * ratio_to_mask))
+                    if step == steps:
+                        # If it's the final step munmask everything that is left. 0 tokens remain masked.
+                        num_to_mask = 0
+                    else:
+                        # Else only unmask one (n_digit=4 & step=1 = 3 masked.)
+                        num_to_mask = self.n_digit - step
 
                     next_targets = torch.where(is_masked, global_pred_ids, current_targets)
                     if num_to_mask > 0:
+                        # Keep lowest confidence masked
                         mask_idx = torch.topk(confidence, k=num_to_mask, dim=-1, largest=False).indices
                         next_targets.scatter_(1, mask_idx, self.denoiser.mask_token_id)
+
                     current_targets = next_targets
 
                 token_logits = F.log_softmax(final_logits_stack, dim=-1).view(B, -1)
