@@ -16,7 +16,6 @@ from genrec.model import AbstractModel
 from genrec.tokenizer import AbstractTokenizer
 
 
-# Technically not denoising but demasking, because discrete diffusion
 class Denoiser(nn.Module):
     def __init__(self, n_digit, n_embd, vocab_size, mask_token_id, n_layers, n_heads, dropout, do_norm_and_scale):
         super().__init__()
@@ -503,16 +502,16 @@ class DRPG(AbstractModel):
                     if step == steps:
                         final_logits = logits  # (B, n_digit, codebook_size)
 
+                    # Get highest confidence digits
                     probs = torch.softmax(logits, dim=-1)
                     max_probs, pred_ids = probs.max(dim=-1)
-
-                    global_pred_ids = pred_ids + offsets.unsqueeze(0)
-
                     confidence = max_probs.clone()
                     confidence[~is_masked] = 1e9
 
+                    global_pred_ids = pred_ids + offsets.unsqueeze(0)
+
                     if step == steps:
-                        # If it's the final step munmask everything that is left. 0 tokens remain masked.
+                        # If it's the final step, unmask everything that is left. 0 tokens remain masked.
                         num_to_mask = 0
                     else:
                         # Else only unmask one (n_digit=4 & step=1 = 3 masked.)
@@ -520,13 +519,12 @@ class DRPG(AbstractModel):
 
                     next_targets = torch.where(is_masked, global_pred_ids, current_targets)
                     if num_to_mask > 0:
-                        # Keep lowest confidence masked
+                        # Keep lowest confidence digits masked
                         mask_idx = torch.topk(confidence, k=num_to_mask, dim=-1, largest=False).indices
                         next_targets.scatter_(1, mask_idx, self.denoiser.mask_token_id)
 
                     current_targets = next_targets
 
-                # TODO AFTER RUN WITH DO_NORM_AND_SCALE=FALSE AND COMPARE PERFORMANCE
                 token_logits = F.log_softmax(final_logits, dim=-1).view(B, -1)
 
                 if self.generate_w_decoding_graph:
