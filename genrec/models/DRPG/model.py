@@ -129,7 +129,7 @@ class DRPG(AbstractModel):
         self.denoiser.init_target_embeddings(self.gpt2.wte.weight)
 
         self.temperature = self.config['temperature']
-        self.loss_fct = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.ignored_label, label_smoothing=0.1)  # Label smoothing like in eq. 3 from https://arxiv.org/pdf/2510.21805
+        self.loss_fct = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.ignored_label, label_smoothing=config['label_smoothing'])  # Label smoothing like in eq. 3 from https://arxiv.org/pdf/2510.21805
 
         # Graph-constrained decoding
         self.generate_w_decoding_graph = False
@@ -491,12 +491,12 @@ class DRPG(AbstractModel):
                         'memory_padding_mask': memory_padding_mask
                     })
 
-                    logits_stack = denoiser_outputs['logits']
+                    logits = denoiser_outputs['logits']
 
                     if step == steps:
-                        final_logits_stack = logits_stack  # (B, n_digit, codebook_size)
+                        final_logits_stack = logits  # (B, n_digit, codebook_size)
 
-                    probs = torch.softmax(logits_stack, dim=-1)
+                    probs = torch.softmax(logits, dim=-1)
                     max_probs, pred_ids = probs.max(dim=-1)
 
                     global_pred_ids = pred_ids + offsets.unsqueeze(0)
@@ -541,7 +541,7 @@ class DRPG(AbstractModel):
                     top_scores, top_idx = item_logits[0].topk(5, dim=-1)
                     print(f"\n[DEBUG GENERATE] Top 5 Item Scores (Batch 0): {top_scores.tolist()}")
                     print(f"[DEBUG GENERATE] Top 5 Item Indices (Batch 0): {top_idx.tolist()}")
-                    print("Logit Spread (Max - Min):", (logits_stack.max() - logits_stack.min()).item())
+                    print("Logit Spread (Max - Min):", (logits.max() - logits.min()).item())
                     # ----------------------------
                     preds = item_logits.topk(n_return_sequences, dim=-1).indices + 1
                     return preds.unsqueeze(-1)
