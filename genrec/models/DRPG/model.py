@@ -541,11 +541,12 @@ class DRPG(AbstractModel):
                         num_to_mask = 0
                     else:
                         if oracle_active:
-                            # Linearly schedule unmasking ONLY over the free tokens
-                            num_to_mask = int(n_free * (1.0 - step / steps))
+                            # Unmask an even chunk of the free tokens per step
+                            unmask_per_step = n_free // steps
+                            num_to_mask = n_free - (step * unmask_per_step)
                         else:
-                            # Only unmask one (n_digit=4 & step=1 = 3 masked.)
-                            num_to_mask = self.n_digit - step
+                            unmask_per_step = self.n_digit // steps
+                            num_to_mask = self.n_digit - (step * unmask_per_step)
 
                     next_targets = torch.where(is_masked, global_pred_ids, current_targets)
                     if num_to_mask > 0:
