@@ -144,6 +144,11 @@ class DRPG(AbstractModel):
         self.n_edges = config['n_edges']
         self.propagation_steps = config['propagation_steps']
 
+        self.oracle_generate = self.config['oracle_generate']
+        self.n_oracle = self.config["n_oracle"]
+        self.log_pred_acc = self.config["log_pred_acc"]
+        print(f"Using oracle generation: {self.oracle_generate} with {self.n_oracle} digits.")
+        print(f"Logging token prediction accuracy: {self.log_pred_acc}")
 
     def _map_item_tokens(self) -> torch.Tensor:
         """
@@ -358,13 +363,13 @@ class DRPG(AbstractModel):
             i_end = min(i_start + self.chunk_size, n_items)
 
             # shape: (chunk_i_size, 32)
-            tokens_i = self.item_id2tokens[i_start:i_end]  # sub-block for items i
+            tokens_i = self.item_id2tokens[i_start:i_end].to(self.gpt2.device)  # sub-block for items i
 
             for j_start in range(1, n_items, self.chunk_size):
                 j_end = min(j_start + self.chunk_size, n_items)
 
                 # shape: (chunk_j_size, 32)
-                tokens_j = self.item_id2tokens[j_start:j_end]  # sub-block for items j
+                tokens_j = self.item_id2tokens[j_start:j_end].to(self.gpt2.device)  # sub-block for items j
 
                 # We want to compute a sub-block of shape: (chunk_i_size, chunk_j_size).
                 # For each digit k in [0..31], we look up token_sims_01[k, tokens_i[i, k], tokens_j[j, k]].
@@ -465,6 +470,11 @@ class DRPG(AbstractModel):
 
     def generate(self, batch, n_return_sequences=1):
         was_training = self.training
+
+        if was_training:
+            self._total_correct_guesses = 0
+            self._total_free_tokens = 0
+
         self.eval()
         try:
             with torch.no_grad():
@@ -483,6 +493,22 @@ class DRPG(AbstractModel):
                     device=device
                 )
 
+                n_oracle = 0
+                n_free = self.n_digit
+                oracle_active = self.oracle_generate  # For diffusion multistep explanation tests
+                log_pred_acc = self.log_pred_acc  # For diffusion multistep explanation tests
+
+                if (oracle_active or log_pred_acc) and 'labels' in batch:
+                    target_item_ids = batch['labels'].view(-1)
+                    true_target_tokens = self.item_id2tokens[target_item_ids]
+
+                    if oracle_active:
+                        n_oracle = self.n_oracle
+                        n_free = self.n_digit - n_oracle
+
+                        # Reveal the first n_oracle tokens
+                        current_targets[:, :n_oracle] = true_target_tokens[:, :n_oracle]
+
                 offsets = torch.arange(self.n_digit, device=device) * self.config['codebook_size'] + 1
 
                 final_logits = None
@@ -500,7 +526,7 @@ class DRPG(AbstractModel):
                     logits = denoiser_outputs['logits']
 
                     if step == steps:
-                        final_logits = logits  # (B, n_digit, codebook_size)
+                        final_logits = logits.clone()  # (B, n_digit, codebook_size)
 
                     # Get highest confidence digits
                     probs = torch.softmax(logits, dim=-1)
@@ -514,8 +540,12 @@ class DRPG(AbstractModel):
                         # If it's the final step, unmask everything that is left. 0 tokens remain masked.
                         num_to_mask = 0
                     else:
-                        # Else only unmask one (n_digit=4 & step=1 = 3 masked.)
-                        num_to_mask = self.n_digit - step
+                        if oracle_active:
+                            # Linearly schedule unmasking ONLY over the free tokens
+                            num_to_mask = int(n_free * (1.0 - step / steps))
+                        else:
+                            # Only unmask one (n_digit=4 & step=1 = 3 masked.)
+                            num_to_mask = self.n_digit - step
 
                     next_targets = torch.where(is_masked, global_pred_ids, current_targets)
                     if num_to_mask > 0:
@@ -523,7 +553,27 @@ class DRPG(AbstractModel):
                         mask_idx = torch.topk(confidence, k=num_to_mask, dim=-1, largest=False).indices
                         next_targets.scatter_(1, mask_idx, self.denoiser.mask_token_id)
 
+                    # Re-enforce true targets if oracle is active
+                    if oracle_active and 'labels' in batch:
+                        next_targets[:, :n_oracle] = true_target_tokens[:, :n_oracle]
+
                     current_targets = next_targets
+
+                # Keep track of token prediction accuracy
+                if log_pred_acc and 'labels' in batch:
+                    if not hasattr(self, '_total_correct_guesses'):
+                        self._total_correct_guesses = 0
+                        self._total_free_tokens = 0
+
+                    # Create a mask so we only calculate accuracy on unmasked tokens
+                    free_token_mask = torch.ones(B, self.n_digit, dtype=torch.bool, device=device)
+                    free_token_mask[:, :n_oracle] = False
+
+                    correct_guesses = (current_targets == true_target_tokens) & free_token_mask
+
+                    if free_token_mask.sum() > 0:
+                        self._total_correct_guesses += correct_guesses.sum().item()
+                        self._total_free_tokens += free_token_mask.sum().item()
 
                 token_logits = F.log_softmax(final_logits, dim=-1).view(B, -1)
 

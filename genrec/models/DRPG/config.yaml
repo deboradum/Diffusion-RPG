@@ -53,3 +53,7 @@ n_views: 2
 
 label_smoothing: 0.1
 do_norm_and_scale: true
+
+oracle_generate: false  # Reveals tokens. Used for diffusion multistep denoising tests
+n_oracle: 0  # Reveals n tokens. Used for diffusion multistep denoising tests
+log_pred_acc: false  #  maintains a prediction accuracy counter in generate(). Used for diffusion multistep denoising tests

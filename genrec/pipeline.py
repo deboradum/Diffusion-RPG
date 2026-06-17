@@ -126,6 +126,14 @@ class Pipeline:
                 self.accelerator.log({f'Test_Metric/{key}': test_results[key]})
         self.log(f'Test Results: {test_results}')
 
+        if self.config['log_pred_acc'] and getattr(self.trainer.model, 'log_pred_acc', False) and hasattr(self.trainer.model, '_total_correct_guesses'):
+            if self.trainer.model._total_free_tokens > 0:
+                final_acc = self.trainer.model._total_correct_guesses / self.trainer.model._total_free_tokens
+                print(f"\nFinal Token Accuracy on masked digits: {final_acc:.4f} ({self.trainer.model._total_correct_guesses}/{self.trainer.model._total_free_tokens})")
+
+            self.trainer.model._total_correct_guesses = 0
+            self.trainer.model._total_free_tokens = 0
+
         self.trainer.end()
         return {
             'best_epoch': best_epoch,
